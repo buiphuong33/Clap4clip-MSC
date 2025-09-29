@@ -26,7 +26,6 @@ class Adapter(nn.Module):
 
         self.fc = nn.Sequential(nn.Linear(in_dim, out_dim))
         self.sigma = sigma
-        self.class_stats = {}
         # init_weights(self.fc)
 
     def forward(self, x):
@@ -545,6 +544,7 @@ class ClClipVariational(Evaluator):
     def __init__(self, args, use_float32=False, use_grad_checkpoint=False):
         super().__init__(args)
         self.args = args
+        self.class_stats = {}
         clip_model, _ = load(args.ckpt_path, device=f"cuda:{args.default_gpu}")
         clip_model.eval()
         if use_float32:
