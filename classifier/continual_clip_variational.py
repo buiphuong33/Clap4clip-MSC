@@ -281,7 +281,7 @@ class CLIP(nn.Module):
                     if getattr(self.args, "use_msc", False) and hasattr(self, "class_stats"):
                         for local_idx, cls_id in enumerate(range(start_cls_idx, end_cls_idx)):
                             if cls_id in self.class_stats:
-                                text_features_relevant[local_idx] = self.class_stats[cls_id]["mu"].to(text_features_relevant.device)
+                                text_features_relevant[local_idx] = self.class_stats[cls_id]["mu"].to(text_features_relevant.device).type(text_features_relevant.dtype)
 
                     text_features_ = text_features_relevant
                     if self.args.use_vga:
@@ -294,30 +294,6 @@ class CLIP(nn.Module):
                     qdist = self.get_variational_adapter_features(text_features_, i if self.args.expandable_adapter else 0)            
                     rsamples = qdist.rsample([self.forward_times])
                    
-                    # --- [NEW] Covariance Calibration (CC) loss ---
-                    # Điều kiện: chỉ khi có stats phiên trước và bật cờ
-                    if getattr(self.args, "use_cov_calib", False) and hasattr(self, "class_stats") and self.args.sess > 0:
-                        # Dùng mean theo mẫu để giảm nhiễu
-                        new_feat_mean = rsamples.mean(0)  # [num_cls_in_task, D]
-                        cc_terms = []
-                        start = start_cls_idx; end = end_cls_idx
-                        for local_idx, cls_id in enumerate(range(start, end)):
-                            if cls_id in self.class_stats:
-                                mu_prev = self.class_stats[cls_id]["mu"].to(new_feat_mean.device)
-                                cov_prev = self.class_stats[cls_id]["cov"].to(new_feat_mean.device)
-                                # nghịch đảo có ổn định vì cov_prev đã +epsI khi ước lượng
-                                inv_cov = torch.linalg.inv(cov_prev)
-                                diff_new = (new_feat_mean[local_idx] - mu_prev).unsqueeze(0)  # [1,D]
-                                # d_M(x, mu_prev; cov_prev)
-                                d_new = torch.sqrt((diff_new @ inv_cov @ diff_new.t()).clamp_min(1e-12)).squeeze()
-                                # xấp xỉ d_old ~ 0 quanh mu_prev (phiên trước)
-                                d_old = 0.0
-                                cc_terms.append(torch.abs(d_new - d_old))
-                        if len(cc_terms):
-                            # “đặt” CC vào nhóm kl_losses để cộng chung bên dưới
-                            cc_loss = torch.stack(cc_terms).mean()
-                            kl_losses.append(self.args.lambda_cov * cc_loss)
-                    # --- [END NEW] ---
 
                     text_features_ = text_features_.unsqueeze(0).expand(self.forward_times, -1, -1, -1) if self.args.hierarchical else text_features_.unsqueeze(0).expand(self.forward_times, -1, -1)
                     if self.args.hierarchical:
@@ -430,16 +406,13 @@ class CLIP(nn.Module):
                     start = start_cls_idx; end = end_cls_idx
                     for local_idx, cls_id in enumerate(range(start, end)):
                         if cls_id in self.class_stats:
-                            mu_prev = self.class_stats[cls_id]["mu"].to(new_feat_mean.device)
-                            cov_prev = self.class_stats[cls_id]["cov"].to(new_feat_mean.device)
-                            # nghịch đảo có ổn định vì cov_prev đã +epsI khi ước lượng
-                            inv_cov = torch.linalg.inv(cov_prev)
-                            diff_new = (new_feat_mean[local_idx] - mu_prev).unsqueeze(0)  # [1,D]
-                            # d_M(x, mu_prev; cov_prev)
-                            d_new = torch.sqrt((diff_new @ inv_cov @ diff_new.t()).clamp_min(1e-12)).squeeze()
-                            # xấp xỉ d_old ~ 0 quanh mu_prev (phiên trước)
-                            d_old = 0.0
-                            cc_terms.append(torch.abs(d_new - d_old))
+                            mu_prev = self.class_stats[cls_id]["mu"].to(new_feat_mean.device).float()
+                            cov_prev = self.class_stats[cls_id]["cov"].to(new_feat_mean.device).float()
+                            diff32 = (new_feat_mean[local_idx].float() - mu_prev).unsqueeze(0)
+                            inv32  = torch.linalg.inv(cov_prev)
+                            quad32 = diff32 @ inv32 @ diff32.t()
+                            d_new  = torch.sqrt(quad32.clamp_min(1e-12)).squeeze()
+                            cc_terms.append(torch.abs(d_new - 0.0))
                     if len(cc_terms):
                         # “đặt” CC vào nhóm kl_losses để cộng chung bên dưới
                         cc_loss = torch.stack(cc_terms).mean()
