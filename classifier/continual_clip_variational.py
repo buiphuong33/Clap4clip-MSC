@@ -282,7 +282,7 @@ class CLIP(nn.Module):
                     text_features_relevant = text_features[start_cls_idx:end_cls_idx].clone()
 
                     # NEW: Test-time MSC — thay prototype bằng mean đã hiệu chỉnh nếu có
-                    if getattr(self.args, "use_msc", False) and hasattr(self, "class_stats"):
+                    if (getattr(self.args, "use_msc", False) and hasattr(self, "class_stats") and (i < self.args.sess)):
                         for local_idx, cls_id in enumerate(range(start_cls_idx, end_cls_idx)):
                             if cls_id in self.class_stats:
                                 text_features_relevant[local_idx] = self.class_stats[cls_id]["mu"].to(text_features_relevant.device).type(text_features_relevant.dtype)
@@ -631,8 +631,8 @@ class ClClipVariational(Evaluator):
         inter_adapter_distances = []
         run_times = []
         # self.model.eval()
-        if self.model.vga is not None:
-            self.model.vga.train()
+        #if self.model.vga is not None:
+        #   self.model.vga.train()
         if self.args.sess >= 0:
             for epoch in tqdm(range(self.epochs)):
                 for idx, (x, y, index) in tqdm(enumerate(train_loader), total=len(train_loader), desc = 'Training'):
@@ -874,7 +874,7 @@ class ClClipVariational(Evaluator):
     @torch.no_grad()
     def inference(self,image, label, num_test, test_class):
         self.model.eval()
-        logits, feats = self.model(image, label, test=True, return_mean=False)
+        logits, feats = self.model(image, label, test=True, return_mean=True)
         return logits.float(), feats
 
     
