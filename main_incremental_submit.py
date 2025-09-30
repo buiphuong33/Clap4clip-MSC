@@ -121,6 +121,17 @@ def parse_option():
     parser.add_argument("--stats-on-train", action="store_true", default=True,
                         help="Estimate class stats on the current session train loader")
 
+    # --- Classifier head flags ---
+    parser.add_argument("--use-head", action="store_true", default=False,
+                        help="Use a linear head at inference instead of cosine with text prototypes")
+    parser.add_argument("--train-head", action="store_true", default=False,
+                        help="Retrain the head after each session using Gaussian samples from (mu, cov)")
+    parser.add_argument("--head-samples", type=int, default=64,
+                        help="Number of synthetic samples per class for head training")
+    parser.add_argument("--head-steps", type=int, default=150,
+                        help="SGD update steps to train the head")
+    parser.add_argument("--head-lr", type=float, default=0.1,
+                        help="Learning rate for the head optimizer")
 
 
     args, unparsed = parser.parse_known_args()

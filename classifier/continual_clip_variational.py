@@ -98,7 +98,7 @@ class CLIP(nn.Module):
         self.task_to_distribution = task_to_distribution
         self.init_new_heads()
 
-    
+        self.classifier_head = None
     def init_new_heads(self):
         def get_new_task_embed(var=False):
             if var:
@@ -248,6 +248,10 @@ class CLIP(nn.Module):
         logit_scale = self.logit_scale.exp()
         if test:
             with torch.no_grad():
+                if getattr(self.args, "use_head", False) and (getattr(self, "classifier_head", None) is not None):
+                    # head mong đầu vào đã được L2-normalize (image_features_normed)
+                    logits = self.classifier_head(image_features_normed)   # [B, C]
+                    return logits, (image_features_normed.detach().cpu(), None)
                 text_features = self.frozen_text_features
                 context = image_features_normed.clone() # torch.cat([image_features.unsqueeze(0), self.task_token_two[-1]], 1)
                 n_query = text_features.shape[0]
@@ -508,7 +512,27 @@ class CLIP(nn.Module):
 
     @torch.no_grad()
     def set_classifier(self):
-        pass 
+        D = self.frozen_text_features.shape[-1]
+        C = self.n_class
+
+        # Tập hợp prototype cho từng lớp theo thứ tự global id
+        weight_rows = []
+        for cls_id in range(C):
+            if hasattr(self, "class_stats") and (cls_id in self.class_stats):
+                proto = self.class_stats[cls_id]["mu"].to(self.logit_scale.device)
+            else:
+                proto = self.frozen_text_features[cls_id].to(self.logit_scale.device)
+            proto = proto / (proto.norm() + 1e-12)
+            # dùng dtype của CLIP (thường là fp16) để nhất quán suy luận
+            proto = proto.type(self.dtype)
+            weight_rows.append(proto)
+        W = torch.stack(weight_rows, dim=0)  # [C, D]
+
+        # Tạo hoặc thay head (out_features phải khớp số lớp hiện tại)
+        if (self.classifier_head is None) or (self.classifier_head.out_features != C):
+            self.classifier_head = nn.Linear(D, C, bias=False).to(self.logit_scale.device).type(self.dtype)
+        # gán trọng số (nn.Linear có shape [out, in])
+        self.classifier_head.weight.data.copy_(W)
 
     @property #变成属性
     def dtype(self):
@@ -675,7 +699,13 @@ class ClClipVariational(Evaluator):
             if train_loader is not None and getattr(self.args, "stats_on_train", True):
                 stats = self.compute_text_side_stats(train_loader)
                 self.apply_msc_update(stats)
-        self.model.set_classifier()
+                self.model.set_classifier()
+                if getattr(self.args, "train_head", False):
+                    self._retrain_head(
+                        steps=getattr(self.args, "head_steps", 150),
+                        lr=getattr(self.args, "head_lr", 0.1),
+                        samples_per_class=getattr(self.args, "head_samples", 64),
+                    )
         if self.args.distill and finalize:
             self.preserve_copy_for_distillation()
 
@@ -924,3 +954,72 @@ class ClClipVariational(Evaluator):
             else:
                 self.class_stats[c] = {"mu": s["mu"], "cov": s["cov"]}
 
+    @torch.no_grad()
+    def _sample_gaussians_for_head(self, samples_per_class=64):
+        """
+        Lấy K mẫu per-class từ N(mu_c, cov_c) (FP32 cho ổn định),
+        L2-normalize rồi cast về dtype của model để train head.
+        Trả về X [N, D], y [N], với y = global class id.
+        """
+        device = torch.device(f"cuda:{self.args.default_gpu}")
+        dtype_model = self.clip_model.dtype  # thường là torch.float16
+
+        feats = []
+        labels = []
+        C = self.model.n_class
+
+        for cls_id in range(C):
+            if (cls_id not in self.class_stats) or ("mu" not in self.class_stats[cls_id]):
+                # nếu chưa có stats, dùng prototype frozen
+                mu = self.model.frozen_text_features[cls_id].detach().cpu().float()
+                cov = torch.eye(mu.numel(), dtype=torch.float32) * 1e-2
+            else:
+                mu = self.class_stats[cls_id]["mu"].detach().cpu().float()
+                cov = self.class_stats[cls_id]["cov"].detach().cpu().float()
+                # đảm bảo PD
+                cov = cov + torch.eye(cov.shape[0]) * 1e-5
+
+            mvn = torch.distributions.MultivariateNormal(mu, covariance_matrix=cov)
+            x = mvn.sample((samples_per_class,))  # [K, D] FP32
+            # L2-normalize rồi cast
+            x = x / (x.norm(dim=-1, keepdim=True) + 1e-12)
+            x = x.to(device=device, dtype=dtype_model)
+            feats.append(x)
+            labels.append(torch.full((samples_per_class,), cls_id, device=device, dtype=torch.long))
+
+        X = torch.cat(feats, dim=0)    # [K*C, D]
+        y = torch.cat(labels, dim=0)   # [K*C]
+        return X, y
+
+    def _retrain_head(self, steps=150, lr=0.1, samples_per_class=64):
+        """
+        Train nhanh linear head bằng synthetic features. Chỉ update head.
+        """
+        if not getattr(self.args, "use_head", False):
+            return  # chỉ train khi có ý định dùng head
+
+        # đảm bảo head tồn tại và khớp số lớp hiện tại
+        self.model.set_classifier()
+        head = self.model.classifier_head
+        device = torch.device(f"cuda:{self.args.default_gpu}")
+
+        # freeze phần còn lại
+        for n, p in self.model.named_parameters():
+            if "classifier_head" not in n:
+                p.requires_grad_(False)
+        head.train()
+
+        X, y = self._sample_gaussians_for_head(samples_per_class=samples_per_class)  # dtype = model dtype
+        # dùng optimizer riêng cho head
+        opt = torch.optim.SGD(head.parameters(), lr=lr, momentum=0.9)
+
+        # vì X,y thường không to, train mini-batch toàn bộ 1 phát/step
+        for _ in range(steps):
+            # logits: Linear expects FP16/FP32 ok; loss tính ở dtype hiện tại
+            logits = head(X)  # [N, C]
+            loss = F.cross_entropy(logits, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        head.eval()
