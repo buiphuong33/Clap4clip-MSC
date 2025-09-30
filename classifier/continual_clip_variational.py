@@ -300,12 +300,14 @@ class CLIP(nn.Module):
                         rsamples = rsamples.flatten(0, 1)
                         text_features_ = text_features_.flatten(0, 1)
                     text_features_ = rsamples + text_features_ 
-                    
+                    text_features_ = text_features_ / (text_features_.norm(dim=-1, keepdim=True) + 1e-12)
+                    eff_proto = text_features_.mean(0)               # [num_cls_in_task, D]
+                    eff_proto = eff_proto / (eff_proto.norm(dim=-1, keepdim=True) + 1e-12)
                     logits_ = logit_scale * image_features_normed @ text_features_.permute(0, 2, 1) 
                   
                     logits.append(logits_)
                     if need_text_feats:
-                        samplewise_text_feats.append(text_features_relevant)
+                        samplewise_text_feats.append(eff_proto)
                 # logits = torch.stack(logits, 0).sum(0)
                 logits = torch.cat(logits, -1)
                 logits = logits.detach()
@@ -424,7 +426,7 @@ class CLIP(nn.Module):
                     rsamples = rsamples.flatten(0, 1)
                     text_features_ = text_features_.flatten(0, 1)
                 text_features_ = rsamples + text_features_ 
-                
+                text_features_ = text_features_ / (text_features_.norm(dim=-1, keepdim=True) + 1e-12)
                 taskwise_means.append(rsamples.mean(0))
                 if self.args.lasp  and self.args.beta > 0 and (finetuning or (not finetuning and  self.args.sess == i)):
                     prior_text_features = self.frozen_text_features_individual.clone()[start_cls_idx:end_cls_idx]
