@@ -874,7 +874,7 @@ class ClClipVariational(Evaluator):
     @torch.no_grad()
     def inference(self,image, label, num_test, test_class):
         self.model.eval()
-        logits, feats = self.model(image, label, test=True, return_mean=True)
+        logits, feats = self.model(image, label, test=True, return_mean=False)
         return logits.float(), feats
 
     
